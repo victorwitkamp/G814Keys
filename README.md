@@ -15,6 +15,10 @@ brightness keys the firmware then sends the standard ACPI video notification `No
   the firmware's `EC0.SKEY` does the rest. macOS evaluates only a four-character name on a published ACPI device, and `EC0`
   is not published (its `_STA` is Zero), so the WMI entry is the one way in.
   [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys) turns the resulting notification into the brightness keys.
+  The firmware's `BRTN` also notifies the dGPU's panel device (`\_SB.PC00.PEG1.PEGP.EDP1`), which the Optimus SSDT defines only
+  when the panel is wired to the dGPU; in hybrid mode the method aborts there (`AE_NOT_FOUND`) after the iGPU notification has been
+  delivered, so each press logs an ACPI error and the WMI call returns an error status (`WMNB 0xe00002bc` in the plugin's log). The
+  keys work regardless; an SSDT that defines an empty `EDP1` under `PEGP` removes the error.
 - **Keyboard light** (usages `0xc4` / `0xc5`): this model has no firmware path for it (its WMI device `0x00050021` answers
   unsupported), so the keys set the keyboard's level (0-3) with the feature report Linux's `hid-asus` sends. The level cannot be read
   back; the first key press starts from 2.
