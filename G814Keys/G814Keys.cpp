@@ -6,12 +6,13 @@
 //  The internal keyboard (USB 0b05:19b6, ASUS "N-KEY") reports its Fn hotkeys in input report 0x5a on the vendor usage
 //  page 0xff31, one usage per key (0x10 brightness down, 0x20 brightness up, 0xc4 / 0xc5 keyboard light up / down), which
 //  macOS's HID event driver does not read. On Windows, ASUS's software passes the usage to the firmware through the ATK
-//  WMI method (WMNB, DEVS 0x00100021 -> \_SB.PC00.LPCB.EC0.SKEY); for the brightness keys SKEY runs _Q17 / _Q18 -> QLIB ->
-//  BRTN, which sends the ACPI video notification Notify (\_SB.PC00.GFX0.DD1F, 0x87 / 0x86). G814Keys reads report 0x5a
-//  on its way through AppleUserHIDDevice::handleReportWithTime and calls SKEY with the usage the same way, off the report
-//  path; BrightnessKeys turns the notification into the brightness keys. The keyboard light has no firmware path on this
-//  model (its WMI device 0x00050021 answers unsupported), so its keys set the keyboard's level with the feature report
-//  Linux's hid-asus sends.
+//  WMI method \_SB.ATKD.WMNB (method DEVS, device 0x00100021), which returns \_SB.PC00.LPCB.EC0.SKEY (usage); for the
+//  brightness keys SKEY runs _Q17 / _Q18 -> QLIB -> BRTN, which sends the ACPI video notification
+//  Notify (\_SB.PC00.GFX0.DD1F, 0x87 / 0x86). G814Keys reads report 0x5a on its way through
+//  AppleUserHIDDevice::handleReportWithTime and calls WMNB the same way, off the report path (macOS evaluates only a
+//  four-character name on a published ACPI device, and EC0 is not published: its _STA is Zero); BrightnessKeys turns the
+//  notification into the brightness keys. The keyboard light has no firmware path on this model (QLIB only queues
+//  0xc4 / 0xc5 for a WMI listener), so its keys set the keyboard's level with the feature report Linux's hid-asus sends.
 //
 //  The report format, the handshake and the keyboard-light command are those of Linux's drivers/hid/hid-asus.c.
 //
@@ -61,9 +62,15 @@ constexpr uint8_t KeyBrightnessUp = 0x20;
 constexpr uint8_t KeyKbdLightUp = 0xc4;
 constexpr uint8_t KeyKbdLightDown = 0xc5;
 
-// The firmware's hotkey entry (ATKD WMNB DEVS 0x00100021), and the display id BRTN tests before it notifies DD1F
-const char SkeyPath[] = "\\_SB.PC00.LPCB.EC0.SKEY";
-const char DidxPath[] = "\\DIDX";
+// The ATK WMI device, whose WMNB (instance, method id, buffer) is the firmware's entry for the hotkeys: method DEVS with
+// the buffer's first DWord 0x00100021 returns EC0.SKEY (second DWord). WMNB reads five DWords from the buffer.
+const char AtkdPath[] = "IOACPIPlane:/_SB/ATKD";
+constexpr uint32_t WmiMethodDevs = 0x53564544;
+constexpr uint32_t WmiDeviceHotkey = 0x00100021;
+
+// The internal panel's ACPI device: BRTN notifies it when (DIDX & 0x0f0f) == 0x0400, and its _ADR returns DIDX & 0xffff once
+// the firmware has enumerated the panel.
+const char PanelPath[] = "IOACPIPlane:/_SB/PC00@0/GFX0@20000/DD1F@400";
 
 constexpr uint32_t MaxRows = 48;
 
@@ -77,7 +84,7 @@ mach_vm_address_t orgHandleReportWithTime;
 IOHIDDevice *volatile nkey;
 uint8_t lastKey;
 
-// Keys pressed on the report path, handled by the worker thread call (SKEY and the feature reports may block).
+// Keys pressed on the report path, handled by the worker thread call (WMNB and the feature reports may block).
 IOSimpleLock *queueLock;
 uint8_t queue[16];
 uint32_t queueHead, queueTail;
@@ -86,19 +93,19 @@ IOLock *workerLock;
 bool needInit;
 bool kbdLightSupported;
 int kbdLevel = -1;
+IOACPIPlatformDevice *atkd, *panel;
 
 volatile uint32_t rows;
 #define ROW(...) do { if (__sync_fetch_and_add(&rows, 1) < MaxRows) SYSLOG("g814keys", __VA_ARGS__); } while (0)
 
-IOACPIPlatformDevice *acpiDevice() {
-	static IOACPIPlatformDevice *device;
-	if (!device) {
-		auto entry = IORegistryEntry::fromPath("IOACPIPlane:/_SB/PC00@0");
-		device = OSDynamicCast(IOACPIPlatformDevice, entry);
-		if (!device)
+IOACPIPlatformDevice *acpiDevice(const char *path, IOACPIPlatformDevice **cache) {
+	if (!*cache) {
+		auto entry = IORegistryEntry::fromPath(path);
+		*cache = OSDynamicCast(IOACPIPlatformDevice, entry);
+		if (!*cache)
 			OSSafeReleaseNULL(entry);
 	}
-	return device;
+	return *cache;
 }
 
 IOReturn setFeature(IOHIDDevice *device, const uint8_t *bytes, size_t size) {
@@ -122,8 +129,16 @@ IOReturn getFeature(IOHIDDevice *device, uint8_t id, uint8_t *bytes, size_t size
 	return status;
 }
 
+bool allZero(const uint8_t *bytes, size_t size) {
+	for (size_t i = 0; i < size; i++)
+		if (bytes[i])
+			return false;
+	return true;
+}
+
 // hid-asus.c asus_initialize_reports / asus_kbd_init: the handshake, set and read back, on each of the keyboard's report IDs;
-// asus_kbd_get_functions: byte 6 of the reply, bit 0 = the keyboard light.
+// asus_kbd_get_functions: byte 6 of the reply, bit 0 = the keyboard light. A read that completes with no data (every byte
+// zero) is reported and not held against the keyboard: the N-KEY answers the same query with bit 0 set from user space.
 void initKeyboard(IOHIDDevice *device) {
 	static const uint8_t ids[] {KbdReportID, KbdLedReportID};
 	for (auto id : ids) {
@@ -131,36 +146,47 @@ void initKeyboard(IOHIDDevice *device) {
 		uint8_t ack[KbdReportSize] {};
 		auto set = setFeature(device, handshake, sizeof(handshake));
 		auto get = getFeature(device, id, ack, sizeof(ack));
-		ROW("handshake 0x%02x: set 0x%x, get 0x%x, %s", id, set, get, memcmp(ack, handshake, sizeof(handshake)) ? "no echo" : "echoed");
+		ROW("handshake 0x%02x: set 0x%x, get 0x%x, %s (read %02x %02x %02x %02x)", id, set, get,
+			memcmp(ack, handshake, sizeof(handshake)) ? "no echo" : "echoed", ack[0], ack[1], ack[2], ack[3]);
 	}
 
 	const uint8_t query[] {KbdReportID, 0x05, 0x20, 0x31, 0x00, 0x08};
 	uint8_t reply[KbdReportSize] {};
 	auto set = setFeature(device, query, sizeof(query));
 	auto get = getFeature(device, KbdReportID, reply, sizeof(reply));
-	kbdLightSupported = set == kIOReturnSuccess && get == kIOReturnSuccess && (reply[6] & 1);
-	ROW("functions 0x%02x (set 0x%x, get 0x%x): keyboard light %s", reply[6], set, get, kbdLightSupported ? "yes" : "no");
+	bool answered = set == kIOReturnSuccess && get == kIOReturnSuccess;
+	bool noData = answered && allZero(reply, sizeof(reply));
+	kbdLightSupported = answered && ((reply[6] & 1) || noData);
+	ROW("functions 0x%02x (set 0x%x, get 0x%x): keyboard light %s", reply[6], set, get,
+		(reply[6] & 1) ? "yes" : noData ? "assumed (the read returned no data)" : "no");
 
-	uint32_t didx = 0;
-	auto acpi = acpiDevice();
-	auto status = acpi ? acpi->evaluateInteger(DidxPath, &didx) : kIOReturnNotFound;
-	ROW("DIDX 0x%x (0x%x): BRTN %s DD1F", didx, status, (didx & 0x0f0f) == 0x0400 ? "notifies" : "does not notify");
+	uint32_t adr = 0;
+	auto dd1f = acpiDevice(PanelPath, &panel);
+	auto status = dd1f ? dd1f->evaluateInteger("_ADR", &adr) : kIOReturnNotFound;
+	ROW("DD1F._ADR 0x%x (0x%x): BRTN %s DD1F", adr, status, (adr & 0x0f0f) == 0x0400 ? "notifies" : "does not notify");
 }
 
-IOReturn callSkey(uint8_t key, uint32_t *ret) {
-	auto acpi = acpiDevice();
-	if (!acpi)
+// The Windows path: WMNB (0, DEVS, {0x00100021, usage, 0, 0, 0}) returns EC0.SKEY (usage), One when the usage is handled.
+IOReturn sendHotkey(uint8_t key, uint32_t *ret) {
+	auto device = acpiDevice(AtkdPath, &atkd);
+	if (!device)
 		return kIOReturnNotFound;
-	auto arg = OSNumber::withNumber(key, 32);
-	if (!arg)
-		return kIOReturnNoMemory;
-	OSObject *params[] {arg};
-	OSObject *result = nullptr;
-	auto status = acpi->evaluateObject(SkeyPath, &result, params, 1);
-	if (auto number = OSDynamicCast(OSNumber, result))
-		*ret = number->unsigned32BitValue();
-	OSSafeReleaseNULL(result);
-	arg->release();
+	uint32_t args[5] {WmiDeviceHotkey, key, 0, 0, 0};
+	auto instance = OSNumber::withNumber(0ull, 32);
+	auto method = OSNumber::withNumber(WmiMethodDevs, 32);
+	auto buffer = OSData::withBytes(args, sizeof(args));
+	IOReturn status = kIOReturnNoMemory;
+	if (instance && method && buffer) {
+		OSObject *params[] {instance, method, buffer};
+		OSObject *result = nullptr;
+		status = device->evaluateObject("WMNB", &result, params, arrsize(params));
+		if (auto number = OSDynamicCast(OSNumber, result))
+			*ret = number->unsigned32BitValue();
+		OSSafeReleaseNULL(result);
+	}
+	OSSafeReleaseNULL(instance);
+	OSSafeReleaseNULL(method);
+	OSSafeReleaseNULL(buffer);
 	return status;
 }
 
@@ -184,8 +210,8 @@ void handleKey(IOHIDDevice *device, uint8_t key) {
 		case KeyBrightnessDown:
 		case KeyBrightnessUp: {
 			uint32_t ret = 0;
-			auto status = callSkey(key, &ret);
-			ROW("key 0x%02x: SKEY 0x%x, returned %u", key, status, ret);
+			auto status = sendHotkey(key, &ret);
+			ROW("key 0x%02x: WMNB 0x%x, returned %u", key, status, ret);
 			break;
 		}
 		case KeyKbdLightUp:
@@ -220,6 +246,15 @@ void runWorker(thread_call_param_t, thread_call_param_t) {
 	IOLockUnlock(workerLock);
 }
 
+// hid-asus.c: codes the ROG N-KEY keyboards send on their own (ASUS_SPURIOUS_CODE_*), not keys.
+bool spurious(uint8_t key) {
+	switch (key) {
+		case 0xea: case 0xec: case 0x02: case 0x8a: case 0x9e:
+			return true;
+	}
+	return false;
+}
+
 // Only the first of the report's five usage slots is read, as hid-asus fixes the descriptor's count to 1: the others carry
 // companion bytes (the camera key's state byte 0x10 would read as brightness down). A key acts once, when its usage appears.
 void noteReport(IOMemoryDescriptor *report) {
@@ -230,7 +265,7 @@ void noteReport(IOMemoryDescriptor *report) {
 	if (key == lastKey)
 		return;
 	lastKey = key;
-	if (key == 0)
+	if (key == 0 || spurious(key))
 		return;
 	IOSimpleLockLock(queueLock);
 	if (queueTail - queueHead < arrsize(queue))

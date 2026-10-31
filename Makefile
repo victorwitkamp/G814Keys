@@ -3,8 +3,12 @@
 MKSDK    ?= MacKernelSDK
 LILU     ?= Lilu.kext
 SDK      ?= $(shell xcrun --sdk macosx --show-sdk-path)
+# Apple's clang: another clang (Homebrew's LLVM) registers the kext's global destructors through __cxa_atexit, which the kernel
+# does not export, and the kext then fails to link at load.
+CC       ?= $(shell xcrun -f clang)
+CXX      ?= $(shell xcrun -f clang++)
 OUT      ?= build
-VERSION  := 1.0.0
+VERSION  := 1.0.1
 KEXT     := $(OUT)/G814Keys.kext
 DEFS     := -DPRODUCT_NAME=G814Keys -DMODULE_VERSION=$(VERSION) -D__KERNEL__ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
 INC      := -nostdinc -I$(MKSDK)/Headers -I$(LILU)/Contents/Resources
@@ -18,19 +22,19 @@ all: $(KEXT)
 
 $(OUT)/G814Keys.o: G814Keys/G814Keys.cpp
 	mkdir -p $(OUT)
-	clang++ $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(OUT)/plugin_start.o: $(LILU)/Contents/Resources/Library/plugin_start.cpp
 	mkdir -p $(OUT)
-	clang++ $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(OUT)/G814Keys_info.o: G814Keys/G814Keys_info.c
 	mkdir -p $(OUT)
-	clang $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@
 
 $(KEXT): $(OUT)/G814Keys.o $(OUT)/plugin_start.o $(OUT)/G814Keys_info.o G814Keys/Info.plist
 	rm -rf $(KEXT); mkdir -p $(KEXT)/Contents/MacOS
-	clang++ $(LDFLAGS) $(OUT)/G814Keys.o $(OUT)/plugin_start.o $(OUT)/G814Keys_info.o -o $(KEXT)/Contents/MacOS/G814Keys
+	$(CXX) $(LDFLAGS) $(OUT)/G814Keys.o $(OUT)/plugin_start.o $(OUT)/G814Keys_info.o -o $(KEXT)/Contents/MacOS/G814Keys
 	cp G814Keys/Info.plist $(KEXT)/Contents/Info.plist
 	chmod -R 755 $(KEXT)
 	shasum -a 256 $(KEXT)/Contents/MacOS/G814Keys
