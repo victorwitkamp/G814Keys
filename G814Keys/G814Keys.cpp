@@ -14,6 +14,11 @@
 //  notification into the brightness keys. The keyboard light has no firmware path on this model (QLIB only queues
 //  0xc4 / 0xc5 for a WMI listener), so its keys set the keyboard's level with the feature report Linux's hid-asus sends.
 //
+//  The keyboard also sends its Consumer Power usage (input report 0x02, usage 0x0030) on some ordinary key presses. macOS turns it
+//  into the power key, and one held past loginwindow's 0.35 s debounce puts the machine to sleep while the user types. G814Keys
+//  drops that report before Apple's driver sees it, as hid-asus does for the ROG N-KEY keyboards (QUIRK_ROG_NKEY_KEYBOARD, which
+//  0x19b6 carries). The power button itself is the firmware's (ACPI PWRB) and is not affected.
+//
 //  The report format, the handshake and the keyboard-light command are those of Linux's drivers/hid/hid-asus.c.
 //
 
@@ -62,6 +67,12 @@ constexpr uint8_t KeyBrightnessUp = 0x20;
 constexpr uint8_t KeyKbdLightUp = 0xc4;
 constexpr uint8_t KeyKbdLightDown = 0xc5;
 
+// The keyboard's Consumer Control report: one 16-bit usage (descriptor: report ID 0x02, usages 0x000-0x23c, size 16, count 1).
+// hid-asus.c asus_raw_event: "G713 and G733 send these codes on some keypresses, depending on the key pressed it can trigger a
+// shutdown event if not caught" (data[0] == 0x02 && data[1] == 0x30). Here the whole usage is compared: 0x0030 is Consumer Power.
+constexpr uint8_t ConsumerReportID = 0x02;
+constexpr uint16_t ConsumerPower = 0x0030;
+
 // The ATK WMI device, whose WMNB (instance, method id, buffer) is the firmware's entry for the hotkeys: method DEVS with
 // the buffer's first DWord 0x00100021 returns EC0.SKEY (second DWord). WMNB reads five DWords from the buffer.
 const char AtkdPath[] = "IOACPIPlane:/_SB/ATKD";
@@ -94,6 +105,10 @@ bool needInit;
 bool kbdLightSupported;
 int kbdLevel = -1;
 IOACPIPlatformDevice *atkd, *panel;
+
+// Consumer Power reports dropped on the report path, and the count the worker last logged.
+volatile uint32_t droppedPower;
+uint32_t loggedPower;
 
 volatile uint32_t rows;
 #define ROW(...) do { if (__sync_fetch_and_add(&rows, 1) < MaxRows) SYSLOG("g814keys", __VA_ARGS__); } while (0)
@@ -243,6 +258,11 @@ void runWorker(thread_call_param_t, thread_call_param_t) {
 		if (device)
 			handleKey(device, key);
 	}
+	uint32_t dropped = droppedPower;
+	if (dropped != loggedPower) {
+		loggedPower = dropped;
+		ROW("Consumer Power reports dropped: %u", dropped);
+	}
 	IOLockUnlock(workerLock);
 }
 
@@ -274,10 +294,25 @@ void noteReport(IOMemoryDescriptor *report) {
 	thread_call_enter(worker);
 }
 
+// The Consumer report carrying Power, which the keyboard sends on ordinary key presses (see ConsumerPower).
+bool spuriousPower(IOMemoryDescriptor *report) {
+	uint8_t data[3] {};
+	auto length = report->getLength();
+	if (length < 2 || report->readBytes(0, data, length < sizeof(data) ? length : sizeof(data)) < 2)
+		return false;
+	return data[0] == ConsumerReportID && (data[1] | data[2] << 8) == ConsumerPower;
+}
+
 IOReturn wrapHandleReportWithTime(IOHIDDevice *that, uint64_t timeStamp, IOMemoryDescriptor *report, IOHIDReportType reportType,
 	IOOptionBits options) {
-	if (that == nkey && reportType == kIOHIDReportTypeInput && report)
+	if (that == nkey && reportType == kIOHIDReportTypeInput && report) {
+		if (spuriousPower(report)) {
+			__sync_fetch_and_add(&droppedPower, 1);
+			thread_call_enter(worker);
+			return kIOReturnSuccess;
+		}
 		noteReport(report);
+	}
 	return FunctionCast(wrapHandleReportWithTime, orgHandleReportWithTime)(that, timeStamp, report, reportType, options);
 }
 

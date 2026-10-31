@@ -8,7 +8,8 @@ SDK      ?= $(shell xcrun --sdk macosx --show-sdk-path)
 CC       ?= $(shell xcrun -f clang)
 CXX      ?= $(shell xcrun -f clang++)
 OUT      ?= build
-VERSION  := 1.0.1
+VERSION  := 1.0.2
+# the objects depend on this Makefile, so a VERSION change rebuilds them all
 KEXT     := $(OUT)/G814Keys.kext
 DEFS     := -DPRODUCT_NAME=G814Keys -DMODULE_VERSION=$(VERSION) -D__KERNEL__ -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT
 INC      := -nostdinc -I$(MKSDK)/Headers -I$(LILU)/Contents/Resources
@@ -20,15 +21,15 @@ LDFLAGS  := -arch x86_64 -isysroot $(SDK) -L$(MKSDK)/Library/x86_64 -Xlinker -ke
 
 all: $(KEXT)
 
-$(OUT)/G814Keys.o: G814Keys/G814Keys.cpp
+$(OUT)/G814Keys.o: G814Keys/G814Keys.cpp Makefile
 	mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OUT)/plugin_start.o: $(LILU)/Contents/Resources/Library/plugin_start.cpp
+$(OUT)/plugin_start.o: $(LILU)/Contents/Resources/Library/plugin_start.cpp Makefile
 	mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OUT)/G814Keys_info.o: G814Keys/G814Keys_info.c
+$(OUT)/G814Keys_info.o: G814Keys/G814Keys_info.c Makefile
 	mkdir -p $(OUT)
 	$(CC) $(CFLAGS) -c $< -o $@
 

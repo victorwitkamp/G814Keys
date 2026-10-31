@@ -22,6 +22,10 @@ brightness keys the firmware then sends the standard ACPI video notification `No
 - **Keyboard light** (usages `0xc4` / `0xc5`): this model has no firmware path for it (its WMI device `0x00050021` answers
   unsupported), so the keys set the keyboard's level (0-3) with the feature report Linux's `hid-asus` sends. The level cannot be read
   back; the first key press starts from 2.
+- **The power key while typing:** the keyboard also sends its Consumer Power usage (report `0x02`, usage `0x0030`) on some ordinary
+  key presses, which macOS turns into the power key: one held past loginwindow's 0.35 s debounce sleeps the machine, the screen goes
+  black for 2-3 s and the next key press wakes it. The plugin drops that report before Apple's driver sees it, as Linux's `hid-asus`
+  does for the ROG N-KEY keyboards. The power button is the firmware's (ACPI `PWRB`) and is not affected.
 - At start-up it sends the keyboard the handshake `hid-asus` sends (report IDs `0x5a` and `0x5d`) and asks which functions it
   has. The kernel-side read may complete with no data; the keyboard light is then assumed (the N-KEY answers the same query
   with its backlight bit set from user space).
